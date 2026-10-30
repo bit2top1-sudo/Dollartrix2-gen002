@@ -1,0 +1,1048 @@
+name: VPS-Shim Runner
+
+# ══════════════════════════════════════════════════════════════════
+# Warm-handoff model (this revision).
+#
+# Two jobs, same workflow file, same concurrency group:
+#
+#   `session` -- the currently-active job. Runs setup, activates
+#   (bot/webui/tunnel + resumes prior launched processes), then runs
+#   the shared sync loop (vps-shim/scripts/sync_loop.sh). At T-20m
+#   remaining in its own budget, it dispatches a `standby` run via
+#   repository_dispatch (event: dispatch-standby-shim-runner). At its
+#   own budget end it shuts down, checkpoints, writes+pushes a
+#   go-file (vps-shim/state/go_standby.json), and exits. It no longer
+#   dispatches its successor directly -- that's `standby`'s job now,
+#   once `standby` sees the go-file.
+#
+#   `standby` -- dispatched ~20 minutes before the current session
+#   ends. Runs the SAME setup (setup_env.sh) ahead of time, on its
+#   own fresh runner VM, then polls for the go-file. The moment it
+#   sees one, it activates (same activate.sh session uses) and falls
+#   into the same sync_loop.sh -- becoming the new active session, in
+#   place, on the same job/run. It will itself dispatch the next
+#   standby at ITS OWN T-20m, via the same sync_loop.sh logic. While
+#   it waits for the go-file, it also freeze-spawns (SIGSTOPped)
+#   replicas of the outgoing session's currently-running bots and
+#   marks each one ready via the shared handoff manifest, so the
+#   outgoing session has something live to hand off to instead of a
+#   cold kill. Each iteration of the same wait loop also watches that
+#   manifest for a live-swap ("go") signal and resumes (SIGCONT) the
+#   matching replica the moment it sees one.
+#
+# This means there is close to zero cold gap between one session
+# ending and its successor being ready: standby's setup (venv, deps,
+# cloudflared install, etc) already happened during the outgoing
+# session's last 20 minutes, in parallel, on a separate VM. The only
+# serialized part is: outgoing session's own shutdown + checkpoint
+# push + go-file push, then standby's git pull of that checkpoint +
+# activation -- seconds, not the old 10-minute enforced cold gap.
+#
+# FALLBACK (no standby was ever dispatched -- session crashed/was
+# cancelled before reaching T-20m, or the dispatch call itself
+# failed): nothing here recovers that automatically. watchdog.yml
+# polls every 20 minutes; if it sees no completed runner.yml run
+# recently and nothing in_progress, it dispatches a fresh cold
+# `restart-shim-runner` session exactly as before. Worst case is a
+# gap bounded by the watchdog's own poll interval, not an indefinite
+# stall.
+#
+# Both jobs previously shared the SAME concurrency group so that
+# shimdeploy.py's redeploy path (disable workflow, then
+# cancel_inflight_runs() across the whole repo) could force-cancel a
+# `standby` run exactly like it does `session`. That sharing was a bug:
+# standby's own routine T-20m dispatch is not an exceptional redeploy
+# event, it's a guaranteed part of every session's normal lifecycle --
+# so cancel-in-progress on a shared group meant every standby dispatch
+# immediately killed its own still-running parent session, before that
+# session ever reached its own graceful T-0 shutdown / go-file push.
+# Every handoff self-destructed this way.
+#
+# `session` and `standby` now each have their OWN concurrency group
+# (vps-shim-runner-session / vps-shim-runner-standby), so dispatching
+# one can never cancel the other. This costs nothing on the redeploy
+# side: cancel_inflight_runs() cancels every active run repo-wide by
+# hitting the Actions API directly on run status -- confirmed it has no
+# dependency on concurrency groups at all -- so a redeploy still kills
+# both a live session and a live standby exactly as before.
+#
+# `session`'s group keeps cancel-in-progress: two overlapping `session`
+# runs (e.g. a manual restart while one's already active) should still
+# cancel each other -- there is never a reason to run two active
+# sessions side by side.
+#
+# `standby`'s group is back to cancel-in-progress: true as of
+# v199-guard-standby (v198d-teardown-path had set it to false --
+# reverted; see below for why). A duplicate standby dispatch (two
+# sessions each independently reaching their own T-20m in close
+# succession, a manual re-dispatch, etc.) is resolved the same way it
+# was before v198d: the newer run evicts the older one. This IS what
+# killed #136 (a standby cancelled after waiting 5h50m, with no way to
+# know it was about to see the go-file) -- v198d's response was to drop
+# cancel-in-progress entirely and add claim_standby.sh instead. That
+# fix didn't hold up: v198d has never once completed a warm handoff,
+# where the prior cancel-in-progress:true revision did so occasionally.
+# Root cause of the regression: removing cancel-in-progress didn't just
+# stop the *bad* cancellations, it stopped standby cleanup entirely --
+# stale/duplicate standby runs now accumulate and sit waiting instead of
+# ever being resolved, and claim_standby.sh's file-based race only ever
+# matters AFTER a go-file appears, so it does nothing for the more
+# common failure mode (a go-file that's late, lost, or never written).
+#
+# IMPORTANT -- what reverting to true actually fixes, and what it can't:
+# GitHub's own concurrency docs are explicit that a QUEUED run in a
+# group is evicted unconditionally by a newer dispatch, REGARDLESS of
+# cancel-in-progress -- that setting only governs a run that's already
+# RUNNING. And a RUNNING job cancelled via cancel-in-progress is killed
+# outright (confirmed: no SIGINT/SIGTERM grace window the job's own code
+# can catch, unlike a plain step cancellation) -- there is no in-job
+# trap, signal handler, or "finish what you're doing first" mechanism
+# that can intercept either kind of eviction once GitHub decides to act.
+# #136's actual failure (a standby killed while genuinely about to
+# promote) is therefore NOT fixable by anything running inside the
+# standby job itself, with cancel-in-progress true OR false -- so this
+# revision does not attempt to. What IS fixable, and what v199 actually
+# does:
+#   1) sync_loop.sh's own T-20m dispatch now checks the Actions API for
+#      an existing queued/in_progress runner.yml run before dispatching
+#      a new standby, and skips the dispatch if one is already found --
+#      closing the routine, self-inflicted case (this shim dispatching
+#      a second standby onto its own still-waiting first one) that #136
+#      actually was. This can't see every possible race (a manual
+#      workflow_dispatch landing in the same few seconds isn't covered
+#      by a check-then-act pair of API calls), but it makes "there is
+#      something to cancel" the rare case again, not the routine one.
+#   2) The go-file write+push path (sync_loop.sh) is now retried and
+#      loudly alerted on failure, instead of a single unguarded attempt
+#      that could silently skip the go-file entirely under `set -e`.
+#      A standby that's genuinely still alive and waiting should now
+#      reliably see the go-file the moment its session ends, which is
+#      what actually determines whether a handoff can go warm at all.
+# claim_standby.sh (state/standby_claim.json) is left in place, unused
+# in the common case now that cancel-in-progress again keeps at most one
+# standby alive most of the time -- it's a harmless backstop for the
+# residual race window (1) can't close, not load-bearing the way it was
+# under v198d.
+#
+# What did NOT change from the prior revision: RUN_BUDGET_SECONDS
+# (5h50m), the reason schedule: cron is not used for anything
+# timing-sensitive (see prior notes, still true), the mechanics of
+# git_pull.sh/git_push.sh, and cancel-in-progress's tradeoff on the
+# `session` group specifically (a healthy mid-flight session gets cut
+# off immediately by a manual redeploy rather than finishing
+# gracefully -- deliberately accepted, see prior notes).
+#
+# v198d-teardown-path's tightening of the watchdog's own cold-start
+# fallback (watchdog.yml: poll interval 20m -> 1m, gap threshold 40m ->
+# 5m) is KEPT -- that fallback is what still catches every case this
+# revision doesn't (the residual race window in (1), a go-file that
+# still somehow never reaches standby, etc.), so it stays a tight
+# backstop rather than a wide one, same reasoning as before, just no
+# longer the ONLY layer of defense the way it was under v198d.
+# standing between an edge case and an empty system, but it still needs
+# to be a tight backstop, not just a wide one.
+# ══════════════════════════════════════════════════════════════════
+
+on:
+  workflow_dispatch:
+    inputs:
+      role:
+        description: session or standby
+        required: false
+        default: session
+        type: string
+      cycle_id:
+        required: false
+        default: ''
+        type: string
+      from_run_id:
+        required: false
+        default: ''
+        type: string
+  repository_dispatch:
+    types: [restart-shim-runner, dispatch-standby-shim-runner]
+
+env:
+  RUN_BUDGET_SECONDS: 21000
+  # Retained for the fallback/manual path only -- standby's normal
+  # dispatch has no fixed sleep gap (see header). Kept in case a
+  # manual workflow_dispatch of `session` is ever used without a
+  # standby cycle already primed (e.g. very first cold start).
+  DOWNTIME_GAP_SECONDS: 600
+  STANDBY_DISPATCH_LEAD_SECONDS: 4500
+  STANDBY_WAIT_CEILING_SECONDS: 18000
+  DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+  # v113 fix: repository_dispatch only triggers workflows defined in
+  # the repo the event is POSTed to -- NOT wherever Actions minutes
+  # happen to be unlimited. runner.yml (the thing that has to receive
+  # dispatch-standby-shim-runner and actually run the `standby` job)
+  # lives in THIS repo, so the standby dispatch in sync_loop.sh must
+  # target this repo, not PRIVATE_REPO_NAME. Previously sync_loop.sh
+  # only received PRIVATE_REPO_NAME and reused it by mistake for the
+  # standby dispatch URL too, so the dispatch always 204'd (accepted)
+  # while triggering nothing -- there was no runner.yml listening on
+  # the private repo side. This was silent because a 204 to a repo
+  # with no matching workflow is not an error from GitHub's point of
+  # view, just a no-op.
+  RUNNER_REPO_NAME: ${{ github.event.repository.name }}
+
+jobs:
+  session:
+    if: (github.event_name == 'workflow_dispatch' && github.event.inputs.role != 'standby') || github.event.action == 'restart-shim-runner'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    env:
+      HANDOFF_CYCLE_ID: ${{ github.event.client_payload.cycle_id || github.event.inputs.cycle_id }}
+      DISPATCHED_BY: ${{ github.event.client_payload.from_run_id || github.event.inputs.from_run_id }}
+      DISPATCH_REASON: ${{ github.event.client_payload.reason }}
+      EVENT_ACTION: ${{ github.event.action }}
+      SESSION_ROLE: fresh-boot
+    concurrency:
+      group: vps-shim-runner-session
+      cancel-in-progress: true
+    steps:
+      - name: Write boot-progress helper script
+        # v221 (watchdog robustness: progress-based liveness, replacing
+        # a blind run-age ceiling): the whole reason the watchdog could
+        # only ever guess at "is this run still doing something normal"
+        # before its first real heartbeat (sync_loop.sh's own, written
+        # only once activate.sh's Sync-loop step starts) is that NOTHING
+        # observable was written to state at all during Free disk
+        # space / Setup environment / prepare_venv.sh's from-scratch
+        # freqtrade+numba+scipy install -- often the single largest
+        # fixed cost of a cold start, and highly variable in duration
+        # (PyPI mirror speed, wheel availability, runner CPU variance).
+        # A fixed-seconds ceiling guessing at that duration is
+        # inherently fragile in both directions; this closes the actual
+        # blind spot instead; see watchdog.yml's own liveness-check
+        # step for how these markers are consumed.
+        #
+        # Same no-checkout, best-effort Contents-API append pattern
+        # used everywhere else in this codebase (append_downtime_event.py,
+        # etc.) -- a failed write here must never fail or slow the
+        # session itself, only degrade the watchdog's visibility for
+        # that one tick.
+        run: |
+          cat > /tmp/write_boot_progress.py <<'PYEOF'
+          import base64, json, os, time, urllib.request
+          owner = os.environ['GH_OWNER']
+          repo = os.environ['PRIVATE_REPO_NAME']
+          pat = os.environ['SHIM_PAT']
+          stage = os.environ['BOOT_STAGE']
+          role = os.environ.get('BOOT_ROLE', 'session')
+          path = 'vps-shim/state/boot_progress.json'
+          url = f'https://api.github.com/repos/{owner}/{repo}/contents/{path}'
+          headers = {'Authorization': f'token {pat}', 'Accept': 'application/vnd.github.v3+json'}
+          payload = {'stage': stage, 'role': role, 'epoch': int(time.time()), 'run_id': os.environ.get('GITHUB_RUN_ID', '')}
+          req = urllib.request.Request(url, headers=headers)
+          sha = None
+          try:
+              with urllib.request.urlopen(req, timeout=10) as resp:
+                  sha = json.load(resp).get('sha')
+          except Exception:
+              pass
+          put_body = {'message': f'boot progress: {role} @ {stage}', 'content': base64.b64encode(json.dumps(payload).encode('utf-8')).decode('ascii')}
+          if sha:
+              put_body['sha'] = sha
+          put_req = urllib.request.Request(url, data=json.dumps(put_body).encode('utf-8'), headers={**headers, 'Content-Type': 'application/json'}, method='PUT')
+          try:
+              urllib.request.urlopen(put_req, timeout=10)
+              print(f'PHASE: boot progress recorded ({role} @ {stage})')
+          except Exception as e:
+              print(f'PHASE: failed to record boot progress (non-fatal): {e}')
+          PYEOF
+          sed -i 's/^          //' /tmp/write_boot_progress.py
+
+      - name: Check test mode (skip disk cleanup if rapid-iterating)
+        id: testmode
+        # v237 (rapid-iteration speedup): Free disk space next
+        # (jlumbroso/free-disk-space@main) costs ~2 minutes on every
+        # single run, cold-start or warm handoff, test mode or not --
+        # it's a workflow-level `uses:` step with no path to
+        # test_mode.py's state, since nothing has been checked out
+        # yet at this point in the job. This step is the fix: read
+        # the same GH Contents API file test_mode.py itself reads
+        # (vps-shim/state/shim_test_mode.json), directly, with no
+        # repo checkout needed, and expose the result as this step's
+        # own output so "Free disk space" can gate on it via `if:`.
+        # Best-effort only, same reasoning as every other early-boot
+        # Contents-API read in this file (write_boot_progress.py,
+        # etc.) -- any failure (network blip, file genuinely absent
+        # on a true first-ever run) must resolve to "skip=false" (run
+        # disk cleanup as before), never to "skip=true" on an
+        # unconfirmed read; silently skipping real disk cleanup on a
+        # PRODUCTION run because a transient API call failed would be
+        # a much worse failure mode than the 2 minutes this step
+        # exists to save.
+        env:
+          GH_OWNER: ${{ github.repository_owner }}
+          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
+          SHIM_PAT: ${{ secrets.SHIM_PAT }}
+        run: |
+          SKIP=$(python3 -c "
+          import json, os, urllib.request
+          owner = os.environ['GH_OWNER']
+          repo = os.environ['PRIVATE_REPO_NAME']
+          pat = os.environ['SHIM_PAT']
+          path = 'vps-shim/state/shim_test_mode.json'
+          url = f'https://api.github.com/repos/{owner}/{repo}/contents/{path}'
+          headers = {'Authorization': f'token {pat}', 'Accept': 'application/vnd.github.v3+json'}
+          try:
+              req = urllib.request.Request(url, headers=headers)
+              with urllib.request.urlopen(req, timeout=10) as resp:
+                  import base64
+                  data = json.load(resp)
+                  content = base64.b64decode(data['content']).decode('utf-8')
+              enabled = bool(json.loads(content).get('enabled', True))
+              print('true' if enabled else 'false')
+          except urllib.error.HTTPError as e:
+              # 404 == file confirmed absent == never configured ==
+              # test_mode.py's own documented default (True) -- see
+              # test_mode.py's is_test_mode_enabled() docstring for
+              # why a true first-ever read defaults to on.
+              print('true' if e.code == 404 else 'false')
+          except Exception:
+              print('false')
+          " 2>/tmp/testmode_check_err || echo false)
+          echo "skip_disk_cleanup=${SKIP}" >> "$GITHUB_OUTPUT"
+          if [ "$SKIP" = "true" ]; then
+            echo "test mode is on -- skipping disk cleanup (rapid iteration, not needed for a short compressed session)"
+          else
+            echo "test mode is off (or unconfirmed) -- running disk cleanup as normal"
+          fi
+
+      - name: Free disk space
+        if: steps.testmode.outputs.skip_disk_cleanup != 'true'
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+          docker-images: true
+
+      - name: Record session start
+        id: start
+        env:
+          GH_OWNER: ${{ github.repository_owner }}
+          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
+          SHIM_PAT: ${{ secrets.SHIM_PAT }}
+        run: |
+          START_EPOCH=$(date +%s)
+          echo "start_epoch=${START_EPOCH}" >> "$GITHUB_OUTPUT"
+          echo "Session started at $(date -u -d @${START_EPOCH} '+%Y-%m-%d %H:%M:%S UTC')"
+          BOOT_STAGE="free_disk_space_done" BOOT_ROLE="session" python3 /tmp/write_boot_progress.py || true
+
+      - name: Cache cloudflared + tmux (cold-start speedup)
+        # Fallback-cold-start speedup only -- the warm handoff path
+        # never needs this (standby already has 20 minutes of head
+        # start). This only shortens setup_env.sh's own cost on a
+        # from-scratch runner VM (crash/cancel before standby was
+        # dispatched, or watchdog.yml healing a dead run): cloudflared
+        # is an internet download + dpkg install, and tmux is an
+        # apt-get update+install, on every cold run regardless of the
+        # git checkpoint (unlike the freqtrade venv, which IS carried
+        # in the checkpoint already -- see prepare_venv.sh's own
+        # existing skip-if-present check, unchanged here). Restoring
+        # these two binaries from cache and skipping their
+        # download/install (see setup_env.sh's own command -v guards)
+        # removes the largest remaining fixed cost on that path.
+        uses: actions/cache@v4
+        with:
+          path: |
+            /usr/bin/cloudflared
+            /var/cache/apt/archives/tmux*.deb
+          key: vps-shim-coldstart-tools-v1
+
+      - name: Setup environment
+        env:
+          GH_OWNER: ${{ github.repository_owner }}
+          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
+          SHIM_PAT: ${{ secrets.SHIM_PAT }}
+        run: |
+          BOOT_STAGE="setup_env_started" BOOT_ROLE="session" python3 /tmp/write_boot_progress.py || true
+          # setup_env.sh isn't on disk yet on a fresh runner -- bootstrap
+          # it the same way git_pull.sh used to be bootstrapped, then
+          # hand off to the checked-out copy for everything after.
+          curl -s -H "Authorization: token ${SHIM_PAT}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${GH_OWNER}/${PRIVATE_REPO_NAME}/contents/vps-shim/scripts/setup_env.sh" \
+            | python3 -c "import sys,json,base64; d=json.load(sys.stdin); print(base64.b64decode(d['content']).decode())" \
+            > /tmp/setup_env.sh
+          chmod +x /tmp/setup_env.sh
+          # v221: BOOT_PROGRESS_HOOK tells setup_env.sh where to find
+          # this same helper so it can report progress from INSIDE
+          # prepare_venv.sh's install too -- see setup_env.sh's own
+          # comment at its prepare_venv.sh call site. Passed as an env
+          # var rather than hardcoding the path inside setup_env.sh so
+          # the standby job's identical call site (BOOT_ROLE=standby)
+          # can report under the correct role without a second copy of
+          # setup_env.sh.
+          SHIM_ROOT=/home/runner/shim GH_OWNER="${GH_OWNER}" PRIVATE_REPO_NAME="${PRIVATE_REPO_NAME}" SHIM_PAT="${SHIM_PAT}" BOOT_PROGRESS_HOOK=/tmp/write_boot_progress.py BOOT_ROLE=session bash /tmp/setup_env.sh
+          BOOT_STAGE="setup_env_done" BOOT_ROLE="session" python3 /tmp/write_boot_progress.py || true
+          python3 /home/runner/shim/repo/vps-shim/telegram/handoff_diag.py boot --when boot >/dev/null 2>&1 || true
+
+      - name: Sentinel gate (hold while another session is genuinely alive)
+        env:
+          GH_OWNER: ${{ github.repository_owner }}
+          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
+          SHIM_PAT: ${{ secrets.SHIM_PAT }}
+        run: |
+          touch /tmp/sentinel_holding
+          python3 /home/runner/shim/repo/vps-shim/telegram/sentinel.py wait || echo "sentinel error -- proceeding"
+          rm -f /tmp/sentinel_holding
+
+      - name: Activate (launch bot/webui/tunnel, resume processes)
+        env:
+          SHIM_BOT_TOKEN: ${{ secrets.SHIM_BOT_TOKEN }}
+          SHIM_OWNER_CHAT_ID: ${{ secrets.SHIM_OWNER_CHAT_ID }}
+          SHIM_ROOT: /home/runner/shim
+          GH_OWNER: ${{ github.repository_owner }}
+          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
+          SHIM_PAT: ${{ secrets.SHIM_PAT }}
+          ACTIVATION_REASON: cold-start
+        run: |
+          BOOT_STAGE="activate_started" BOOT_ROLE="session" python3 /tmp/write_boot_progress.py || true
+          bash /home/runner/shim/repo/vps-shim/scripts/activate.sh
+
+      - name: Sync loop within budget (dispatches standby at T-20m, hands off at T-0)
+        env:
+          START_EPOCH: ${{ steps.start.outputs.start_epoch }}
+          GH_OWNER: ${{ github.repository_owner }}
+          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
+          RUNNER_REPO_NAME: ${{ env.RUNNER_REPO_NAME }}
+          SHIM_PAT: ${{ secrets.SHIM_PAT }}
+          SHIM_BOT_TOKEN: ${{ secrets.SHIM_BOT_TOKEN }}
+          SHIM_OWNER_CHAT_ID: ${{ secrets.SHIM_OWNER_CHAT_ID }}
+        run: |
+          bash /home/runner/shim/repo/vps-shim/scripts/sync_loop.sh
+
+      - name: Final checkpoint push (always, including on cancellation)
+        if: always()
+        env:
+          GH_OWNER: ${{ github.repository_owner }}
+          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
+          SHIM_PAT: ${{ secrets.SHIM_PAT }}
+        run: |
+          CAPD=90; CAPS=240; PUSHT=""
+          if [ "${{ job.status }}" = "cancelled" ]; then CAPD=15; CAPS=60; PUSHT="timeout 40"; fi
+          if [ -f /tmp/sentinel_holding ]; then echo "sentinel never activated -- skipping"; exit 0; fi
+          # v221: guarded existence check -- a run that never got past
+          # an early step (e.g. cancelled during Free disk space, before
+          # Setup environment ever clones the repo) has nothing at
+          # $REPO_DIR yet. Previously this always attempted the call
+          # and always failed noisily ("No such file or directory") in
+          # exactly that case -- harmless (this step already tolerates
+          # failure via the trailing `|| true`) but made a routine,
+          # expected outcome look like an error at a glance. Same
+          # end behavior (never blocks job completion), just an honest
+          # log line instead of a misleading one.
+          if [ -f /home/runner/shim/repo/vps-shim/telegram/handoff_diag.py ]; then
+            timeout $CAPD python3 /home/runner/shim/repo/vps-shim/telegram/handoff_diag.py end --job-status "${{ job.status }}" --start-epoch "${{ steps.start.outputs.start_epoch }}" >/dev/null 2>&1 || true
+          fi
+          if [ -f /home/runner/shim/repo/vps-shim/scripts/store_sync.py ]; then
+            SHIM_ROOT=/home/runner/shim timeout $CAPS python3 /home/runner/shim/repo/vps-shim/scripts/store_sync.py save >> /home/runner/shim/repo/vps-shim/logs/store_sync.log 2>&1 || true
+          fi
+          if [ -f /home/runner/shim/repo/vps-shim/scripts/git_push.sh ]; then
+            $PUSHT bash /home/runner/shim/repo/vps-shim/scripts/git_push.sh "checkpoint: final (workflow always-run step)" || true
+          else
+            echo "repo was never checked out this run (likely cancelled before Setup environment) -- nothing to push, skipping"
+          fi
+
+      - name: Self-dispatch replacement session (always, no watchdog)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.SHIM_PAT }}
+          GH_OWNER: ${{ github.repository_owner }}
+          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
+          SHIM_PAT: ${{ secrets.SHIM_PAT }}
+        run: |
+          if [ -f /tmp/sentinel_holding ]; then echo "sentinel never activated -- skipping"; exit 0; fi
+          CYCLE=$(cat /tmp/shim_handoff_cycle_id 2>/dev/null || true)
+          [ -n "$CYCLE" ] || CYCLE="hc-$(date +%s)"
+          cat > /tmp/self_dispatch.py <<'PYEOF'
+          import os, json, time, urllib.request as U, datetime as D
+          repo = os.environ["GH_REPO"]; tok = os.environ["GH_TOKEN"]; me = os.environ["RUN_ID"]
+          cycle = os.environ.get("CYCLE", ""); status = os.environ.get("JOB_STATUS", "")
+          branch = os.environ.get("DEFAULT_BRANCH") or "main"
+          H = {"Authorization": "token " + tok, "Accept": "application/vnd.github.v3+json"}
+          ACTIVE = ("queued", "in_progress", "waiting", "requested", "pending")
+          def call(method, path, body=None):
+              try:
+                  req = U.Request("https://api.github.com/repos/%s/%s" % (repo, path), data=(json.dumps(body).encode() if body is not None else None), headers=H, method=method)
+                  with U.urlopen(req, timeout=20) as r:
+                      return r.status, r.read().decode()
+              except U.HTTPError as e:
+                  return e.code, e.read().decode()[:300]
+              except Exception as e:
+                  return 0, str(e)[:300]
+          def replacement(t0):
+              c, b = call("GET", "actions/runs?per_page=15")
+              try:
+                  runs = json.loads(b)["workflow_runs"]
+              except Exception:
+                  return False
+              for r in runs:
+                  if str(r["id"]) == me or r["status"] not in ACTIVE:
+                      continue
+                  try:
+                      ct = D.datetime.fromisoformat(r["created_at"].replace("Z", "+00:00")).timestamp()
+                  except Exception:
+                      continue
+                  if ct < t0 - 5:
+                      continue
+                  c, jb = call("GET", "actions/runs/%s/jobs" % r["id"])
+                  try:
+                      jobs = json.loads(jb)["jobs"]
+                  except Exception:
+                      continue
+                  if not jobs or any(j["name"] == "session" and j.get("conclusion") != "skipped" for j in jobs):
+                      return True
+              return False
+          def wait_until(t0, end):
+              while time.time() < end:
+                  time.sleep(8)
+                  if replacement(t0):
+                      return True
+              return False
+          t0 = time.time()
+          code, body = call("POST", "dispatches", {"event_type": "restart-shim-runner", "client_payload": {"cycle_id": cycle, "from_run_id": me, "reason": status}})
+          via = "repository_dispatch"
+          ok = 200 <= code < 300 and wait_until(t0, t0 + 45)
+          if not ok:
+              print("self-dispatch via repository_dispatch not confirmed (HTTP %s) %s" % (code, body[:120]))
+              code, body = call("POST", "actions/workflows/runner.yml/dispatches", {"ref": branch})
+              via = "workflow_dispatch"
+              ok = 200 <= code < 300 and wait_until(t0, time.time() + 45)
+          print("self-dispatch %s via %s (HTTP %s, cycle=%s)" % ("confirmed" if ok else "NOT CONFIRMED", via, code, cycle))
+          open("/tmp/self_dispatch_status", "w").write(str(code))
+          PYEOF
+          GH_REPO="${{ github.repository }}" RUN_ID="${{ github.run_id }}" JOB_STATUS="${{ job.status }}" DEFAULT_BRANCH="${{ github.event.repository.default_branch }}" CYCLE="$CYCLE" timeout 160 python3 /tmp/self_dispatch.py || true
+          if [ -f /home/runner/shim/repo/vps-shim/telegram/handoff_diag.py ]; then
+            timeout 30 python3 /home/runner/shim/repo/vps-shim/telegram/handoff_diag.py dispatched --http-status "$(cat /tmp/self_dispatch_status 2>/dev/null || echo none)" --job-status "${{ job.status }}" --to-cycle "${CYCLE}" >/dev/null 2>&1 || true
+          fi
+
+  standby:
+    if: github.event.action == 'dispatch-standby-shim-runner' || (github.event_name == 'workflow_dispatch' && github.event.inputs.role == 'standby')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    env:
+      HANDOFF_CYCLE_ID: ${{ github.event.client_payload.cycle_id || github.event.inputs.cycle_id }}
+      DISPATCHED_BY: ${{ github.event.client_payload.from_run_id || github.event.inputs.from_run_id }}
+      EVENT_ACTION: ${{ github.event.action }}
+      SESSION_ROLE: warm-promoted
+    concurrency:
+      group: vps-shim-runner-standby-${{ github.run_id }}
+      cancel-in-progress: false
+    steps:
+      - name: Record standby job start
+        run: date +%s > /tmp/standby_job_start_epoch
+
+      - name: Write boot-progress helper script
+        # v221: same helper/rationale as the session job's identical
+        # step -- see that step's own comment. Duplicated rather than
+        # factored out, consistent with how this file already
+        # duplicates every other session/standby setup step.
+        run: |
+          cat > /tmp/write_boot_progress.py <<'PYEOF'
+          import base64, json, os, time, urllib.request
+          owner = os.environ['GH_OWNER']
+          repo = os.environ['PRIVATE_REPO_NAME']
+          pat = os.environ['SHIM_PAT']
+          stage = os.environ['BOOT_STAGE']
+          role = os.environ.get('BOOT_ROLE', 'session')
+          path = 'vps-shim/state/boot_progress.json'
+          url = f'https://api.github.com/repos/{owner}/{repo}/contents/{path}'
+          headers = {'Authorization': f'token {pat}', 'Accept': 'application/vnd.github.v3+json'}
+          payload = {'stage': stage, 'role': role, 'epoch': int(time.time()), 'run_id': os.environ.get('GITHUB_RUN_ID', '')}
+          req = urllib.request.Request(url, headers=headers)
+          sha = None
+          try:
+              with urllib.request.urlopen(req, timeout=10) as resp:
+                  sha = json.load(resp).get('sha')
+          except Exception:
+              pass
+          put_body = {'message': f'boot progress: {role} @ {stage}', 'content': base64.b64encode(json.dumps(payload).encode('utf-8')).decode('ascii')}
+          if sha:
+              put_body['sha'] = sha
+          put_req = urllib.request.Request(url, data=json.dumps(put_body).encode('utf-8'), headers={**headers, 'Content-Type': 'application/json'}, method='PUT')
+          try:
+              urllib.request.urlopen(put_req, timeout=10)
+              print(f'PHASE: boot progress recorded ({role} @ {stage})')
+          except Exception as e:
+              print(f'PHASE: failed to record boot progress (non-fatal): {e}')
+          PYEOF
+          sed -i 's/^          //' /tmp/write_boot_progress.py
+
+      - name: Check test mode (skip disk cleanup if rapid-iterating)
+        id: testmode
+        # v237: standby's own copy of the session job's identical step
+        # -- see that step's own comment for full reasoning. Duplicated
+        # rather than factored out, matching how this file already
+        # duplicates every other session/standby setup step.
+        env:
+          GH_OWNER: ${{ github.repository_owner }}
+          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
+          SHIM_PAT: ${{ secrets.SHIM_PAT }}
+        run: |
+          SKIP=$(python3 -c "
+          import json, os, urllib.request
+          owner = os.environ['GH_OWNER']
+          repo = os.environ['PRIVATE_REPO_NAME']
+          pat = os.environ['SHIM_PAT']
+          path = 'vps-shim/state/shim_test_mode.json'
+          url = f'https://api.github.com/repos/{owner}/{repo}/contents/{path}'
+          headers = {'Authorization': f'token {pat}', 'Accept': 'application/vnd.github.v3+json'}
+          try:
+              req = urllib.request.Request(url, headers=headers)
+              with urllib.request.urlopen(req, timeout=10) as resp:
+                  import base64
+                  data = json.load(resp)
+                  content = base64.b64decode(data['content']).decode('utf-8')
+              enabled = bool(json.loads(content).get('enabled', True))
+              print('true' if enabled else 'false')
+          except urllib.error.HTTPError as e:
+              print('true' if e.code == 404 else 'false')
+          except Exception:
+              print('false')
+          " 2>/tmp/testmode_check_err || echo false)
+          echo "skip_disk_cleanup=${SKIP}" >> "$GITHUB_OUTPUT"
+          if [ "$SKIP" = "true" ]; then
+            echo "test mode is on -- skipping disk cleanup (rapid iteration, not needed for a short compressed session)"
+          else
+            echo "test mode is off (or unconfirmed) -- running disk cleanup as normal"
+          fi
+
+      - name: Free disk space
+        if: steps.testmode.outputs.skip_disk_cleanup != 'true'
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+          docker-images: true
+
+      - name: Record boot progress (free disk space done)
+        env:
+          GH_OWNER: ${{ github.repository_owner }}
+          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
+          SHIM_PAT: ${{ secrets.SHIM_PAT }}
+        run: |
+          BOOT_STAGE="free_disk_space_done" BOOT_ROLE="standby" python3 /tmp/write_boot_progress.py || true
+
+      - name: Cache cloudflared + tmux (cold-start speedup)
+        # Same as the session job's identical step -- standby runs the
+        # exact same setup_env.sh, so it benefits from the exact same
+        # cache. Kept as a duplicated step (not a reusable workflow)
+        # since everything else in this file already duplicates
+        # session/standby setup steps rather than factoring them out.
+        uses: actions/cache@v4
+        with:
+          path: |
+            /usr/bin/cloudflared
+            /var/cache/apt/archives/tmux*.deb
+          key: vps-shim-coldstart-tools-v1
+
+      - name: Setup environment (ahead of promotion)
+        env:
+          GH_OWNER: ${{ github.repository_owner }}
+          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
+          SHIM_PAT: ${{ secrets.SHIM_PAT }}
+          SHIM_BOT_TOKEN: ${{ secrets.SHIM_BOT_TOKEN }}
+          SHIM_OWNER_CHAT_ID: ${{ secrets.SHIM_OWNER_CHAT_ID }}
+        run: |
+          BOOT_STAGE="setup_env_started" BOOT_ROLE="standby" python3 /tmp/write_boot_progress.py || true
+          curl -s -H "Authorization: token ${SHIM_PAT}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${GH_OWNER}/${PRIVATE_REPO_NAME}/contents/vps-shim/scripts/setup_env.sh" \
+            | python3 -c "import sys,json,base64; d=json.load(sys.stdin); print(base64.b64decode(d['content']).decode())" \
+            > /tmp/setup_env.sh
+          chmod +x /tmp/setup_env.sh
+          SHIM_ROOT=/home/runner/shim GH_OWNER="${GH_OWNER}" PRIVATE_REPO_NAME="${PRIVATE_REPO_NAME}" SHIM_PAT="${SHIM_PAT}" BOOT_PROGRESS_HOOK=/tmp/write_boot_progress.py BOOT_ROLE=standby bash /tmp/setup_env.sh
+          BOOT_STAGE="setup_env_done" BOOT_ROLE="standby" python3 /tmp/write_boot_progress.py || true
+          python3 /home/runner/shim/repo/vps-shim/telegram/handoff_diag.py emit --phase standby_clone_done --level ok --detail "repo cloned and env set up" --side standby --trace >/dev/null 2>&1 || true
+
+      - name: Wait for go-file (outgoing session's promotion signal)
+        id: wait
+        env:
+          GH_OWNER: ${{ github.repository_owner }}
+          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
+          SHIM_PAT: ${{ secrets.SHIM_PAT }}
+          SHIM_BOT_TOKEN: ${{ secrets.SHIM_BOT_TOKEN }}
+          SHIM_OWNER_CHAT_ID: ${{ secrets.SHIM_OWNER_CHAT_ID }}
+        run: |
+          WAIT_CEILING_SECONDS="${STANDBY_WAIT_CEILING_SECONDS:-18000}"
+          WAITED=0
+          GO_FILE="/home/runner/shim/repo/vps-shim/state/go_standby.json"
+          SPAWN_FROZEN_DONE=0
+          LAST_FREEZE_AT=0
+          STANDBY_START_EPOCH=$(date +%s)
+          LAST_STALE_LOGGED=""
+          LAST_HB_AT=0
+          LAST_PULL_AT=0
+          # Standby milestones also relay to the private repo so they survive if this VM dies.
+          _sdiag() {
+            local ph="$1" lv="$2" dt="$3" args=() kv
+            shift 3
+            for kv in "$@"; do args+=(--field "$kv"); done
+            python3 /home/runner/shim/repo/vps-shim/telegram/handoff_diag.py emit --phase "$ph" --level "$lv" --detail "$dt" --side standby --trace "${args[@]}" >/dev/null 2>&1 || true
+          }
+          _sdiag standby_job_start info "standby job reached wait step (cycle=${HANDOFF_CYCLE_ID:-none})"
+          _sdiag standby_setup_done ok "setup_env finished before wait loop"
+          _standby_hb() {
+            python3 -c "import sys; sys.path.insert(0, '/home/runner/shim/repo/vps-shim/telegram'); import commit_now, os; commit_now.write_role_heartbeat(os.environ['GH_OWNER'], os.environ['PRIVATE_REPO_NAME'], os.environ['SHIM_PAT'], 'standby')" || true
+          }
+          _standby_hb
+          mkdir -p /home/runner/shim/repo/vps-shim/logs
+          rm -f /home/runner/shim/sysbase_early
+          SHIM_ROOT=/home/runner/shim nohup bash -c 'python3 /home/runner/shim/repo/vps-shim/scripts/store_sync.py sysbase && date +%s > /home/runner/shim/sysbase_early' >> /home/runner/shim/repo/vps-shim/logs/store_sync.log 2>&1 &
+          SHIM_ROOT=/home/runner/shim nohup python3 /home/runner/shim/repo/vps-shim/scripts/store_sync.py prefetch --follow --apply >> /home/runner/shim/repo/vps-shim/logs/store_sync.log 2>&1 &
+          _standby_hb
+          while true; do
+            if [ -f "$GO_FILE" ]; then
+              # A go-file older than this standby's start is left over from a previous cycle -- ignore it.
+              GO_WRITTEN=$(python3 -c "import json; print(int(float(json.load(open('$GO_FILE')).get('written_epoch') or 0)))" 2>/dev/null || echo 0)
+              GO_META=$(python3 -c "import json; d=json.load(open('$GO_FILE')); print(d.get('from_run_id', ''), d.get('cycle_id', ''))" 2>/dev/null || echo " ")
+              GO_FROM=${GO_META%% *}
+              GO_CYC=${GO_META#* }
+              GO_AGE=$(( $(date +%s) - GO_WRITTEN ))
+              if [ "$GO_WRITTEN" -ge $((STANDBY_START_EPOCH - 60)) ]; then
+                break
+              fi
+              # git_pull.sh re-fetches the remote copy every tick; report each distinct stale file once, not every 15s.
+              if [ "$GO_WRITTEN" != "$LAST_STALE_LOGGED" ]; then
+                LAST_STALE_LOGGED="$GO_WRITTEN"
+                echo "WARNING: stale go-file ignored (written_epoch=${GO_WRITTEN}, standby started ${STANDBY_START_EPOCH}) -- still waiting"
+                _sdiag standby_go_stale warn "stale go-file ignored (written_epoch=${GO_WRITTEN}, standby started ${STANDBY_START_EPOCH})" go_from_run_id="$GO_FROM" go_cycle_id="$GO_CYC" go_written_epoch="$GO_WRITTEN" go_age_s="$GO_AGE" standby_start_epoch="$STANDBY_START_EPOCH"
+              fi
+              rm -f "$GO_FILE"
+            fi
+            if [ "$WAITED" -ge "$WAIT_CEILING_SECONDS" ]; then
+              echo "no go-file after ${WAIT_CEILING_SECONDS}s -- giving up, watchdog fallback will cold-start instead"
+              echo "promoted=0" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep 4
+            # Real elapsed time: each loop also runs git_pull.sh, so counting 15s per pass undercounts.
+            WAITED=$(( $(date +%s) - STANDBY_START_EPOCH ))
+            if [ $((WAITED - LAST_HB_AT)) -ge 60 ]; then LAST_HB_AT=$WAITED; _standby_hb; _sdiag standby_wait_loop info "still waiting for go-file, waited=${WAITED}s"; fi
+            if [ $((WAITED - LAST_PULL_AT)) -ge 60 ]; then LAST_PULL_AT=$WAITED; bash /home/runner/shim/repo/vps-shim/scripts/git_pull.sh --no-copy-back > /dev/null 2>&1 || true; fi
+
+            if [ "$SPAWN_FROZEN_DONE" -eq 0 ] || [ $((WAITED - LAST_FREEZE_AT)) -ge "${STANDBY_REFREEZE_SECONDS:-90}" ]; then
+              SPAWN_FROZEN_DONE=1
+              LAST_FREEZE_AT=$WAITED
+              cat > /tmp/freeze_spawn.py <<'PYEOF'
+                  import os, sys
+                  sys.path.insert(0, '/home/runner/shim/repo/vps-shim/telegram')
+                  import launched
+                  # state/launched/ is Contents-API-only, not part of the
+                  # git-tree reset -- without this, a fresh standby's local
+                  # LAUNCHED_DIR is always empty and freeze-spawn silently
+                  # has nothing to do, every single run.
+                  _sync_result = launched.sync_launched_records_from_remote()
+                  print(f"PHASE: synced {_sync_result['fetched']} launched record(s) from remote before freeze-spawn")
+                  import handoff_diag as _hd
+                  _hd.emit('standby_records_synced', f"synced {_sync_result['fetched']} record(s)", side='standby', level='ok' if _sync_result['fetched'] else 'warn')
+                  # v293: swap_scope() = running, not superseded, not another standby's
+                  # unswapped replica, one per name -- a stale duplicate record must never
+                  # get its own replica.
+                  in_scope = launched.swap_scope()
+                  print(f'PHASE: found {len(in_scope)} in-scope launch record(s) to freeze-spawn')
+                  if not in_scope:
+                      _hd.emit('standby_freeze_skipped', 'no in-scope launch records to freeze-spawn', side='standby', level='warn', notify=False, reason='no_in_scope_records', fetched=_sync_result['fetched'])
+                  spawned, failed = 0, 0
+                  failed_recs = []
+                  for rec in in_scope:
+                      if launched.replica_exists(rec['launch_id']):
+                          continue
+                      try:
+                          new_id, new_pid = launched.launch_frozen(
+                              rec['cmd'], rec['cwd'],
+                              name=rec.get('name'),
+                              env_vars=rec.get('env_vars'),
+                              replica_of=rec['launch_id'],
+                          )
+                          if launched.is_frozen_and_alive(new_id):
+                              launched.write_handoff_entry(
+                                  rec['launch_id'],
+                                  phase='standby_ready',
+                                  standby_launch_id=new_id,
+                                  standby_pid=new_pid,
+                              )
+                              print(f'  frozen: {rec["cmd"]!r} as pid {new_pid} (standby launch_id {new_id}, for outgoing {rec["launch_id"]})')
+                              _hd.emit('standby_freeze_each', f'frozen replica for {rec["launch_id"]} as {new_id}', side='standby', level='ok')
+                              _hd.emit('standby_ready_written', f'standby_ready written for {rec["launch_id"]}', side='standby', level='ok')
+                              spawned += 1
+                          else:
+                              failed += 1
+                              failed_recs.append(rec)
+                              print(f'  FAILED health check after freeze-spawn: {rec["cmd"]!r} (launch_id {rec["launch_id"]})')
+                              _hd.emit('standby_freeze_each', f'health check failed for {rec["launch_id"]}', side='standby', level='fail')
+                      except Exception as e:
+                          failed += 1
+                          failed_recs.append(rec)
+                          print(f'  FAILED to freeze-spawn {rec.get("cmd")!r} (launch_id {rec.get("launch_id")}): {e}')
+                          _hd.emit('standby_freeze_each', f'freeze-spawn raised for {rec.get("launch_id")}', side='standby', level='fail', error=str(e))
+                  print(f'PHASE: freeze-spawn complete -- {spawned} spawned, {failed} failed, {len(in_scope)} total in-scope')
+
+                  seen_path = '/tmp/freeze_failed_notified'
+                  seen = set(open(seen_path).read().split()) if os.path.exists(seen_path) else set()
+                  failed_recs = [r for r in failed_recs if r['launch_id'] not in seen]
+                  with open(seen_path, 'a') as sf:
+                      sf.write(''.join(r['launch_id'] + chr(10) for r in failed_recs))
+                  if failed_recs:
+                      import notify
+                      for rec in failed_recs:
+                          tail = launched.tail_log(rec['launch_id']) or '(no output captured)'
+                          esc = tail.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                          text = (
+                              f"Standby freeze-spawn did not come up cleanly (will cold-start-fall-back at handoff): <code>{rec.get('cmd')}</code>\n\n"
+                              f"<b>Last output:</b>\n<pre>{esc[-1200:]}</pre>"
+                          )
+                          notify.send(text, 'runner.freeze_spawn_failed', force=True, parse_mode='HTML')
+                      print(f'PHASE: routed {len(failed_recs)} freeze-spawn-failure alert(s) through notify')
+                  _hd.flush_trace()
+          PYEOF
+              sed -i 's/^        //' /tmp/freeze_spawn.py
+              python3 /tmp/freeze_spawn.py || true
+            fi
+
+            python3 /home/runner/shim/repo/vps-shim/telegram/resume_swapped.py "$GO_FILE" || true
+          done
+          echo "go-file found after ${WAITED}s -- promoting"
+          _sdiag standby_promoted ok "go-file found after ${WAITED}s, promoting" go_from_run_id="${GO_FROM:-}" go_cycle_id="${GO_CYC:-}" go_age_s="${GO_AGE:-}" waited_s="$WAITED"
+          echo "promoted=1" >> "$GITHUB_OUTPUT"
+          GO_EPOCH=$(python3 -c "import json; print(json.load(open('$GO_FILE'))['go_epoch'])")
+          echo "go_epoch=${GO_EPOCH}" >> "$GITHUB_OUTPUT"
+          python3 -c "import json; d=json.load(open('$GO_FILE')); json.dump({'finals': d.get('finals') or {}, 'epoch': d.get('epoch'), 'manifest': d.get('manifest') or ''}, open('/home/runner/shim/home_sync_targets.json', 'w'))" || true
+
+      - name: Claim promotion (backstop only as of v199-guard-standby -- see runner.yml header)
+        id: claim
+        if: steps.wait.outputs.promoted == '1'
+        env:
+          GH_OWNER: ${{ github.repository_owner }}
+          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
+          SHIM_PAT: ${{ secrets.SHIM_PAT }}
+          SHIM_BOT_TOKEN: ${{ secrets.SHIM_BOT_TOKEN }}
+          SHIM_OWNER_CHAT_ID: ${{ secrets.SHIM_OWNER_CHAT_ID }}
+        run: |
+          # Bounded retries: an operational failure here (push/pull
+          # error -- network blip, transient API error) must NOT be
+          # treated as a loss. Only an explicit "LOST" from
+          # claim_standby.sh (meaning another run's claim was actually
+          # read back) counts as losing. Conflating the two would mean
+          # a flaky network call could make every standby yield and
+          # nobody ever promote -- exactly the "shift the problem"
+          # failure mode this whole redesign is trying to avoid.
+          RESULT=""
+          CLAIM_T0=$(date +%s)
+          for attempt in 1 2 3 4 5; do
+            if OUT=$(bash /home/runner/shim/repo/vps-shim/scripts/claim_standby.sh \
+                "${{ steps.wait.outputs.go_epoch }}" 2>&1); then
+              RESULT=$(echo "$OUT" | tail -1)
+              echo "$OUT"
+              break
+            fi
+              echo "$OUT"
+              echo "claim attempt ${attempt} failed operationally, retrying..."
+              sleep $((attempt * 5))
+          done
+          python3 /home/runner/shim/repo/vps-shim/telegram/handoff_diag.py emit --phase standby_claim --level info --detail "claim result=${RESULT:-inconclusive} attempts=${attempt:-0} elapsed=$(( $(date +%s) - CLAIM_T0 ))s" --side standby --trace >/dev/null 2>&1 || true
+          if [ "$RESULT" = "WON" ]; then
+            echo "won=1" >> "$GITHUB_OUTPUT"
+          elif [ "$RESULT" = "LOST" ]; then
+            echo "won=0" >> "$GITHUB_OUTPUT"
+          else
+            # All 5 attempts failed operationally with no definitive
+            # WON/LOST answer. Do NOT default to yielding -- that
+            # silently loses the promotion with no one left to notice.
+            # Default to proceeding: if another standby genuinely won,
+            # activate.sh's own resume-processes step is what would
+            # actually collide, and that's a narrower, more visible
+            # failure (loud Telegram resume-failure alerts already
+            # exist for it, see activate.sh) than two runners silently
+            # both declining to come up at all.
+            echo "warning: claim check inconclusive after 5 attempts -- proceeding rather than risking a silent no-promotion" >&2
+            echo "won=1" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Notify yield (lost the claim race)
+        if: steps.wait.outputs.promoted == '1' && steps.claim.outputs.won == '0'
+        env:
+          SHIM_BOT_TOKEN: ${{ secrets.SHIM_BOT_TOKEN }}
+          SHIM_OWNER_CHAT_ID: ${{ secrets.SHIM_OWNER_CHAT_ID }}
+        run: |
+          echo "another standby already claimed this go_epoch -- yielding, exiting cleanly"
+          python3 /home/runner/shim/repo/vps-shim/telegram/notify.py send --source runner.yield -- "🟡 vps-shim standby yielded (another standby already promoted for this handoff)" || true
+
+      - name: Record promotion time
+        id: promote_start
+        if: steps.wait.outputs.promoted == '1' && steps.claim.outputs.won == '1'
+        run: |
+          NOW_E=$(date +%s)
+          echo "start_epoch=${NOW_E}" >> "$GITHUB_OUTPUT"
+          JOB_S=$(cat /tmp/standby_job_start_epoch 2>/dev/null || echo 0)
+          BUDGET=${RUN_BUDGET_SECONDS}
+          if [ "${JOB_S:-0}" -gt 0 ] 2>/dev/null; then BUDGET=$((RUN_BUDGET_SECONDS - (NOW_E - JOB_S))); fi
+          [ "$BUDGET" -ge 900 ] || BUDGET=900
+          echo "budget=${BUDGET}" >> "$GITHUB_OUTPUT"
+          echo "promoted session budget ${BUDGET}s (standby job already ran $((NOW_E - ${JOB_S:-NOW_E}))s of its own timeout)"
+
+      - name: Activate (promoted -- becomes the new active session)
+        if: steps.wait.outputs.promoted == '1' && steps.claim.outputs.won == '1'
+        env:
+          SHIM_BOT_TOKEN: ${{ secrets.SHIM_BOT_TOKEN }}
+          SHIM_OWNER_CHAT_ID: ${{ secrets.SHIM_OWNER_CHAT_ID }}
+          SHIM_ROOT: /home/runner/shim
+          GH_OWNER: ${{ github.repository_owner }}
+          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
+          SHIM_PAT: ${{ secrets.SHIM_PAT }}
+          ACTIVATION_REASON: warm-handoff
+        run: |
+          # Consume the go-file so a stale copy can't cause a second,
+          # bogus promotion later (e.g. if this repo state were ever
+          # re-pulled without a fresh go-file present).
+          python3 /home/runner/shim/repo/vps-shim/telegram/handoff_diag.py boot --when promoted >/dev/null 2>&1 || true
+          rm -f /home/runner/shim/repo/vps-shim/state/go_standby.json
+          python3 -c "import sys, os; sys.path.insert(0, '/home/runner/shim/repo/vps-shim/telegram'); import commit_now; commit_now._gh_delete_file(os.environ['GH_OWNER'], os.environ['PRIVATE_REPO_NAME'], os.environ['SHIM_PAT'], 'vps-shim/state/go_standby.json', 'consume go-file')" || true
+          python3 /home/runner/shim/repo/vps-shim/telegram/handoff_diag.py emit --phase standby_go_deleted_remote --level ok --detail "go-file consumed (local + remote, best effort)" --side standby --trace >/dev/null 2>&1 || true
+          bash /home/runner/shim/repo/vps-shim/scripts/activate.sh
+
+      - name: Sync loop within budget (now the active session)
+        if: steps.wait.outputs.promoted == '1' && steps.claim.outputs.won == '1'
+        env:
+          START_EPOCH: ${{ steps.promote_start.outputs.start_epoch }}
+          RUN_BUDGET_SECONDS: ${{ steps.promote_start.outputs.budget }}
+          GH_OWNER: ${{ github.repository_owner }}
+          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
+          RUNNER_REPO_NAME: ${{ env.RUNNER_REPO_NAME }}
+          SHIM_PAT: ${{ secrets.SHIM_PAT }}
+          SHIM_BOT_TOKEN: ${{ secrets.SHIM_BOT_TOKEN }}
+          SHIM_OWNER_CHAT_ID: ${{ secrets.SHIM_OWNER_CHAT_ID }}
+        run: |
+          bash /home/runner/shim/repo/vps-shim/scripts/sync_loop.sh
+
+      - name: Final checkpoint push (always, including on cancellation)
+        if: always()
+        env:
+          GH_OWNER: ${{ github.repository_owner }}
+          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
+          SHIM_PAT: ${{ secrets.SHIM_PAT }}
+        run: |
+          CAPD=90; CAPS=240; PUSHT=""
+          if [ "${{ job.status }}" = "cancelled" ]; then CAPD=15; CAPS=60; PUSHT="timeout 40"; fi
+          # v221: same existence guard as the session job's identical
+          # step -- see that step's own comment.
+          if [ -f /home/runner/shim/repo/vps-shim/telegram/handoff_diag.py ]; then
+            timeout $CAPD python3 /home/runner/shim/repo/vps-shim/telegram/handoff_diag.py end --job-status "${{ job.status }}" --start-epoch "${{ steps.promote_start.outputs.start_epoch }}" --field promoted="${{ steps.wait.outputs.promoted }}" --field claim_won="${{ steps.claim.outputs.won }}" >/dev/null 2>&1 || true
+          fi
+          if [ -f /home/runner/shim/repo/vps-shim/scripts/store_sync.py ]; then
+            SHIM_ROOT=/home/runner/shim timeout $CAPS python3 /home/runner/shim/repo/vps-shim/scripts/store_sync.py save >> /home/runner/shim/repo/vps-shim/logs/store_sync.log 2>&1 || true
+          fi
+          if [ -f /home/runner/shim/repo/vps-shim/scripts/git_push.sh ]; then
+            $PUSHT bash /home/runner/shim/repo/vps-shim/scripts/git_push.sh "checkpoint: final (workflow always-run step)" || true
+          else
+            echo "repo was never checked out this run (likely cancelled before Setup environment) -- nothing to push, skipping"
+          fi
+
+      - name: Self-dispatch replacement session (always, no watchdog)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.SHIM_PAT }}
+          GH_OWNER: ${{ github.repository_owner }}
+          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
+          SHIM_PAT: ${{ secrets.SHIM_PAT }}
+        run: |
+          # v222 (watchdog removed entirely -- self-respawn replaces it):
+          # DELIBERATELY CONDITIONAL, unlike session's identical-looking
+          # step -- a standby run must NOT self-dispatch just because it
+          # ended. A standby that never gets promoted (its own wait
+          # timed out with no go-file, or it lost claim_standby.sh's
+          # race to another standby) ending is completely normal,
+          # expected, frequent behavior, not a failure needing recovery
+          # -- unconditionally self-dispatching here would mean every
+          # ordinary non-promoted standby spawns ANOTHER standby
+          # forever, a runaway loop with no session ever needing it.
+          #
+          # Only fires when THIS run actually became the live session
+          # (promoted AND won the promotion claim -- see the "Wait for
+          # go-file"/"Claim standby slot" steps' own outputs above) and
+          # is now ending for any reason while acting in that role --
+          # at that point it IS the session, in every sense that
+          # matters here, and needs the exact same respawn guarantee
+          # session's own identical step provides. Same grace-window
+          # mechanics, same reasoning, same "crash is still not
+          # covered" limit -- see that step's own longer comment.
+          cat > /tmp/self_dispatch.py <<'PYEOF'
+          import os, json, time, urllib.request as U, datetime as D
+          repo = os.environ["GH_REPO"]; tok = os.environ["GH_TOKEN"]; me = os.environ["RUN_ID"]
+          cycle = os.environ.get("CYCLE", ""); status = os.environ.get("JOB_STATUS", "")
+          branch = os.environ.get("DEFAULT_BRANCH") or "main"
+          H = {"Authorization": "token " + tok, "Accept": "application/vnd.github.v3+json"}
+          ACTIVE = ("queued", "in_progress", "waiting", "requested", "pending")
+          def call(method, path, body=None):
+              try:
+                  req = U.Request("https://api.github.com/repos/%s/%s" % (repo, path), data=(json.dumps(body).encode() if body is not None else None), headers=H, method=method)
+                  with U.urlopen(req, timeout=20) as r:
+                      return r.status, r.read().decode()
+              except U.HTTPError as e:
+                  return e.code, e.read().decode()[:300]
+              except Exception as e:
+                  return 0, str(e)[:300]
+          def replacement(t0):
+              c, b = call("GET", "actions/runs?per_page=15")
+              try:
+                  runs = json.loads(b)["workflow_runs"]
+              except Exception:
+                  return False
+              for r in runs:
+                  if str(r["id"]) == me or r["status"] not in ACTIVE:
+                      continue
+                  try:
+                      ct = D.datetime.fromisoformat(r["created_at"].replace("Z", "+00:00")).timestamp()
+                  except Exception:
+                      continue
+                  if ct < t0 - 5:
+                      continue
+                  c, jb = call("GET", "actions/runs/%s/jobs" % r["id"])
+                  try:
+                      jobs = json.loads(jb)["jobs"]
+                  except Exception:
+                      continue
+                  if not jobs or any(j["name"] == "session" and j.get("conclusion") != "skipped" for j in jobs):
+                      return True
+              return False
+          def wait_until(t0, end):
+              while time.time() < end:
+                  time.sleep(8)
+                  if replacement(t0):
+                      return True
+              return False
+          t0 = time.time()
+          code, body = call("POST", "dispatches", {"event_type": "restart-shim-runner", "client_payload": {"cycle_id": cycle, "from_run_id": me, "reason": status}})
+          via = "repository_dispatch"
+          ok = 200 <= code < 300 and wait_until(t0, t0 + 45)
+          if not ok:
+              print("self-dispatch via repository_dispatch not confirmed (HTTP %s) %s" % (code, body[:120]))
+              code, body = call("POST", "actions/workflows/runner.yml/dispatches", {"ref": branch})
+              via = "workflow_dispatch"
+              ok = 200 <= code < 300 and wait_until(t0, time.time() + 45)
+          print("self-dispatch %s via %s (HTTP %s, cycle=%s)" % ("confirmed" if ok else "NOT CONFIRMED", via, code, cycle))
+          open("/tmp/self_dispatch_status", "w").write(str(code))
+          PYEOF
+          if [ "${{ steps.wait.outputs.promoted }}" = "1" ] && [ "${{ steps.claim.outputs.won }}" = "1" ]; then
+            CYCLE=$(cat /tmp/shim_handoff_cycle_id 2>/dev/null || true)
+            [ -n "$CYCLE" ] || CYCLE="hc-$(date +%s)"
+            GH_REPO="${{ github.repository }}" RUN_ID="${{ github.run_id }}" JOB_STATUS="${{ job.status }}" DEFAULT_BRANCH="${{ github.event.repository.default_branch }}" CYCLE="$CYCLE" timeout 160 python3 /tmp/self_dispatch.py || true
+            if [ -f /home/runner/shim/repo/vps-shim/telegram/handoff_diag.py ]; then
+              timeout 30 python3 /home/runner/shim/repo/vps-shim/telegram/handoff_diag.py dispatched --http-status "$(cat /tmp/self_dispatch_status 2>/dev/null || echo none)" --job-status "${{ job.status }}" --to-cycle "${CYCLE}" >/dev/null 2>&1 || true
+            fi
+            echo "This standby was promoted and is now ending -- self-dispatch step finished (cycle=${CYCLE})."
+          else
+            echo "This standby was never promoted -- ordinary end, not self-dispatching anything."
+          fi
