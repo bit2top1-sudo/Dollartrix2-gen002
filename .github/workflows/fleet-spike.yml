@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       test:
-        description: env | guest | lease
+        description: env | guest | lease | chain
         required: true
         default: env
         type: string
@@ -25,13 +25,14 @@ env:
 
 jobs:
   single:
-    if: inputs.test == 'env' || inputs.test == 'guest' || inputs.test == 'lease'
+    if: inputs.test == 'env' || inputs.test == 'guest' || inputs.test == 'lease' || inputs.test == 'chain'
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - name: Prepare
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq qemu-system-x86 qemu-utils
+          sudo pip3 install -q --break-system-packages 'websockets==13.1' || sudo pip3 install -q --break-system-packages 'websockets==13.1'
           sudo chmod 666 /dev/kvm || true
           git clone -q --depth 1 "https://x-access-token:${SHIM_PAT}@github.com/${GH_OWNER}/${PRIVATE_REPO_NAME}.git" /home/runner/shim-src
       - name: Run
